@@ -1,0 +1,98 @@
+name: Build & Release Windows EXE
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "Executable name (matches PyInstaller output folder and .exe name)"
+        required: true
+        type: string
+      spec_file:
+        description: "Path to the .spec file relative to repo root"
+        required: false
+        type: string
+        default: ""          # defaults to <app_name>.spec
+      python_version:
+        description: "Python version to use"
+        required: false
+        type: string
+        default: "3.12"
+      release_script:
+        description: "Repo-relative path to the PS1 script that zips the dist folder (receives -Dist <path>)"
+        required: false
+        type: string
+        default: "tools/release.ps1"
+      zip_glob:
+        description: "Glob pattern (relative to repo root) that matches the zip produced by release_script"
+        required: false
+        type: string
+        default: "release/*.zip"
+      extra_pip:
+        description: "Space-separated extra pip packages beyond requirements.txt (e.g. 'pyinstaller')"
+        required: false
+        type: string
+        default: "pyinstaller"
+      qt_api:
+        description: "Set QT_API and PYQTGRAPH_QT_LIB (leave blank to skip)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install dependencies
+        run: |
+          $extra = "${{ inputs.extra_pip }}"
+          if ($extra) { pip install --quiet $extra.Split(" ") }
+          if (Test-Path requirements.txt) { pip install --quiet -r requirements.txt }
+        shell: pwsh
+
+      - name: Build with PyInstaller
+        env:
+          QT_API: ${{ inputs.qt_api }}
+          PYQTGRAPH_QT_LIB: ${{ inputs.qt_api }}
+        run: |
+          $appName  = "${{ inputs.app_name }}"
+          $specFile = "${{ inputs.spec_file }}"
+          if (-not $specFile) { $specFile = "$appName.spec" }
+
+          $dist = "$env:RUNNER_TEMP\$appName-dist"
+          $work = "$env:RUNNER_TEMP\$appName-work"
+
+          python -m PyInstaller --noconfirm --clean `
+            --distpath $dist `
+            --workpath $work `
+            $specFile
+
+          # Run the repo's release/zip script
+          $releaseScript = "${{ inputs.release_script }}"
+          if (Test-Path $releaseScript) {
+            & $releaseScript -Dist "$dist\$appName"
+          } else {
+            # Fallback: simple zip if no release script present
+            $zipDir = "release"
+            New-Item -ItemType Directory -Force $zipDir | Out-Null
+            Compress-Archive -Path "$dist\$appName\*" -DestinationPath "$zipDir\$appName-win64.zip" -Force
+          }
+
+          # Expose zip for the upload step
+          $zip = Get-ChildItem "${{ inputs.zip_glob }}" | Select-Object -First 1
+          echo "ZIP_PATH=$($zip.FullName)" >> $env:GITHUB_ENV
+        shell: pwsh
+
+      - name: Create GitHub Release and upload zip
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_PATH }}
+          generate_release_notes: true
