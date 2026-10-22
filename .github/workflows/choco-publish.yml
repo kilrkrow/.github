@@ -41,7 +41,7 @@ jobs:
       - name: Download release zip and compute SHA256
         id: asset
         run: |
-          $tag     = "${{ inputs.release_tag }}"
+          $tag     = "${{ inputs.release_tag }}" -replace '^refs/tags/', ''
           $pattern = "${{ inputs.zip_pattern }}"
           $version = $tag.TrimStart('v')
 
