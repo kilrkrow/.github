@@ -45,19 +45,14 @@ jobs:
           $pattern = "${{ inputs.zip_pattern }}"
           $version = $tag.TrimStart('v')
 
-          # Resolve the asset download URL via gh CLI
-          $url = gh release view $tag --json assets --jq ".assets[] | select(.name | test(\"$pattern\")) | .url" 2>&1
-          if (-not $url) { throw "No asset matching '$pattern' found in release $tag" }
-          Write-Host "Downloading: $url"
-
           $zipPath = "$env:RUNNER_TEMP\release.zip"
-          Invoke-WebRequest -Uri $url -OutFile $zipPath -Headers @{ Authorization = "Bearer $env:GH_TOKEN" }
+          gh release download $tag --pattern $pattern --output $zipPath
 
           $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash
           Write-Host "SHA256: $hash"
 
-          echo "VERSION=$version"   >> $env:GITHUB_ENV
-          echo "CHECKSUM=$hash"     >> $env:GITHUB_ENV
+          echo "VERSION=$version" >> $env:GITHUB_ENV
+          echo "CHECKSUM=$hash"   >> $env:GITHUB_ENV
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
