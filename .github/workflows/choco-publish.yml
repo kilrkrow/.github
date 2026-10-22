@@ -1,83 +1,274 @@
 name: Publish to Chocolatey
 
+# Reusable workflow: pack a Chocolatey package for an existing GitHub release
+# and push it to the community feed when every safety gate passes.
+#
+# Steps:
+#   1. Check out the CALLER's running commit (for a workflow_run or
+#      workflow_dispatch caller that is the default branch), so the nuspec and
+#      install script come from current main, not from the release tag. An
+#      older tag can therefore be republished with the current package
+#      definition.
+#   2. Download the exact release asset (asset_name) from the caller's repo
+#      and compute its SHA256.
+#   3. Fill __VERSION__ / __CHECKSUM__ in the nuspec and install script.
+#   4. choco pack, then upload the .nupkg as a run artifact (always), so the
+#      package can be tested before moderation approves it.
+#   5. choco push, skipped (exit 0) with "Chocolatey push SKIPPED: <reasons>"
+#      when the tag contains '-', the repository is private, the run is not in
+#      canonical_repo (if set), or the CHOCOLATEY_API_KEY secret is missing.
+#
+# Inputs reach scripts only through env, never interpolated into PowerShell.
+# See README.md for a caller example and the versioning policy.
+
 on:
   workflow_call:
     inputs:
       release_tag:
-        description: "Git tag of the release (e.g. v1.4.2)"
+        description: "Release tag to publish, e.g. v1.4.3 (a refs/tags/ prefix is stripped)"
         required: true
         type: string
-      package_id:
-        description: "Chocolatey package id (lowercase, e.g. netpulse)"
-        required: true
-        type: string
-      zip_pattern:
-        description: "Glob to find the release asset zip (e.g. NetPulse-*-win64.zip)"
+      asset_name:
+        description: "Exact release asset file name; {version} becomes the tag without its leading v, e.g. NetPulse-{version}-win64.zip"
         required: true
         type: string
       nuspec_path:
-        description: "Repo-relative path to the .nuspec template"
+        description: "Repo-relative path to the .nuspec template. Default: the single choco/*.nuspec"
         required: false
         type: string
-        default: ""    # defaults to choco/<package_id>.nuspec
+        default: ""
       install_script_path:
-        description: "Repo-relative path to chocolateyinstall.ps1 template"
+        description: "Repo-relative path to the chocolateyinstall.ps1 template. Default: tools/chocolateyinstall.ps1 next to the nuspec"
         required: false
         type: string
-        default: "choco/tools/chocolateyinstall.ps1"
+        default: ""
+      canonical_repo:
+        description: "Optional owner/name; when set, the push is skipped in any other repository (forks, copies)"
+        required: false
+        type: string
+        default: ""
+      artifact_retention_days:
+        description: "Retention for the .nupkg run artifact"
+        required: false
+        type: number
+        default: 14
     secrets:
       CHOCOLATEY_API_KEY:
-        required: true
+        description: "Chocolatey community API key. Optional: when missing, the package is packed and uploaded but not pushed"
+        required: false
+    outputs:
+      package_id:
+        description: "Package id read from the nuspec"
+        value: ${{ jobs.publish.outputs.package_id }}
+      package_version:
+        description: "Chocolatey package version"
+        value: ${{ jobs.publish.outputs.package_version }}
+      nupkg_name:
+        description: "File name of the packed .nupkg (also the content of the run artifact)"
+        value: ${{ jobs.publish.outputs.nupkg_name }}
+      pushed:
+        description: "'true' if the package was pushed to chocolatey.org, otherwise 'false'"
+        value: ${{ jobs.publish.outputs.pushed }}
+
+permissions:
+  contents: read
 
 jobs:
   publish:
+    name: Pack and publish
     runs-on: windows-latest
+    timeout-minutes: 20
+    concurrency:
+      group: choco-publish-${{ github.repository }}-${{ inputs.release_tag }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      package_id: ${{ steps.meta.outputs.package_id }}
+      package_version: ${{ steps.meta.outputs.package_version }}
+      nupkg_name: ${{ steps.pack.outputs.nupkg_name }}
+      pushed: ${{ steps.push.outputs.pushed }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout caller (running commit, not the tag)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.release_tag }}
+          persist-credentials: false
 
-      - name: Download release zip and compute SHA256
-        id: asset
+      - name: Resolve release metadata
+        id: meta
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          NUSPEC_PATH: ${{ inputs.nuspec_path }}
+          INSTALL_SCRIPT_PATH: ${{ inputs.install_script_path }}
         run: |
-          $tag     = "${{ inputs.release_tag }}" -replace '^refs/tags/', ''
-          $pattern = "${{ inputs.zip_pattern }}"
-          $version = $tag.TrimStart('v')
+          $tag = $env:RELEASE_TAG -replace '^refs/tags/', ''
+          if ($tag -notmatch '^v(\d+(?:\.\d+){1,3})(?:-([0-9A-Za-z][0-9A-Za-z.-]*))?$') {
+            throw "release_tag '$tag' is not a release tag like v1.2.3 or v1.2.3-rc.1"
+          }
+          $core = $Matches[1]
+          $label = $Matches[2]
+          $version = $tag.Substring(1)
+          $prerelease = $tag.Contains('-')
+          # Chocolatey (NuGet v2) prerelease labels must be alphanumeric: 1.2.3-rc.1 -> 1.2.3-rc1
+          $packageVersion = $core
+          if ($label) { $packageVersion += '-' + ($label -replace '[^0-9A-Za-z]', '') }
 
-          $zipPath = "$env:RUNNER_TEMP\release.zip"
-          gh release download $tag --pattern $pattern --output $zipPath
+          $asset = $env:ASSET_NAME.Replace('{version}', $version)
+          if ($asset -notmatch '^[0-9A-Za-z._+-]+$') {
+            throw "asset_name '$asset' must be an exact file name (letters, digits, . _ + -), not a path or glob"
+          }
 
-          $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash
-          Write-Host "SHA256: $hash"
+          if ($env:NUSPEC_PATH) {
+            if (-not (Test-Path -LiteralPath $env:NUSPEC_PATH -PathType Leaf)) { throw "nuspec_path '$env:NUSPEC_PATH' does not exist in the checkout" }
+            $nuspec = (Resolve-Path -LiteralPath $env:NUSPEC_PATH).Path
+          } else {
+            $found = @(Get-ChildItem -Path choco -Filter *.nuspec -File -ErrorAction SilentlyContinue)
+            if ($found.Count -ne 1) { throw "Expected exactly one choco/*.nuspec, found $($found.Count). Set the nuspec_path input." }
+            $nuspec = $found[0].FullName
+          }
+          $id = ([xml](Get-Content -LiteralPath $nuspec -Raw)).package.metadata.id
+          if (-not $id) { throw "No <id> in $nuspec" }
 
-          echo "VERSION=$version" >> $env:GITHUB_ENV
-          echo "CHECKSUM=$hash"   >> $env:GITHUB_ENV
+          if ($env:INSTALL_SCRIPT_PATH) {
+            if (-not (Test-Path -LiteralPath $env:INSTALL_SCRIPT_PATH -PathType Leaf)) { throw "install_script_path '$env:INSTALL_SCRIPT_PATH' does not exist in the checkout" }
+            $install = (Resolve-Path -LiteralPath $env:INSTALL_SCRIPT_PATH).Path
+          } else {
+            $install = Join-Path (Split-Path -Parent $nuspec) 'tools\chocolateyinstall.ps1'
+            if (-not (Test-Path -LiteralPath $install -PathType Leaf)) {
+              Write-Host "::warning::No $install; only the nuspec gets __VERSION__/__CHECKSUM__."
+              $install = ''
+            }
+          }
+
+          Write-Host "tag=$tag version=$version package=$id $packageVersion prerelease=$prerelease"
+          Write-Host "asset=$asset nuspec=$nuspec install=$install"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value @(
+            "tag=$tag",
+            "version=$version",
+            "package_version=$packageVersion",
+            "prerelease=$($prerelease.ToString().ToLowerInvariant())",
+            "asset=$asset",
+            "nuspec=$nuspec",
+            "install=$install",
+            "package_id=$id")
+
+      - name: Download release asset and compute SHA256
+        id: asset
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: pwsh
+          TAG: ${{ steps.meta.outputs.tag }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'release-asset'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $dir $env:ASSET
+          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern $env:ASSET --output $zip --clobber
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $zip)) {
+            throw "Could not download asset '$env:ASSET' from release '$env:TAG' of $env:GITHUB_REPOSITORY. Does the release exist, and does the asset name (app version) match the tag?"
+          }
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+          Write-Host "Asset: $env:ASSET  SHA256: $hash"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "sha256=$hash"
 
       - name: Fill templates (version + checksum)
+        env:
+          NUSPEC: ${{ steps.meta.outputs.nuspec }}
+          INSTALL: ${{ steps.meta.outputs.install }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          PACKAGE_VERSION: ${{ steps.meta.outputs.package_version }}
+          CHECKSUM: ${{ steps.asset.outputs.sha256 }}
         run: |
-          $id      = "${{ inputs.package_id }}"
-          $nuspec  = "${{ inputs.nuspec_path }}"
-          if (-not $nuspec) { $nuspec = "choco/$id.nuspec" }
-          $install = "${{ inputs.install_script_path }}"
-
-          foreach ($f in @($nuspec, $install)) {
-            (Get-Content $f) `
-              -replace '__VERSION__',  $env:VERSION `
-              -replace '__CHECKSUM__', $env:CHECKSUM |
-            Set-Content $f
+          # Literal string replacement (no regex). In the nuspec, <version>__VERSION__</version>
+          # gets the package version; every other __VERSION__ gets the release version
+          # (tag without v), which is what download URLs need.
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          $text = [IO.File]::ReadAllText($env:NUSPEC)
+          $text = $text.Replace('<version>__VERSION__</version>', "<version>$env:PACKAGE_VERSION</version>")
+          $text = $text.Replace('__VERSION__', $env:VERSION).Replace('__CHECKSUM__', $env:CHECKSUM)
+          [IO.File]::WriteAllText($env:NUSPEC, $text, $utf8)
+          $nuspecVersion = ([xml]$text).package.metadata.version
+          if ($nuspecVersion -ne $env:PACKAGE_VERSION) {
+            throw "nuspec <version> is '$nuspecVersion', expected '$env:PACKAGE_VERSION'. Use <version>__VERSION__</version> in the template."
           }
-        shell: pwsh
+          if ($env:INSTALL) {
+            $script = [IO.File]::ReadAllText($env:INSTALL)
+            if (-not $script.Contains('__CHECKSUM__')) { Write-Host "::warning::$env:INSTALL has no __CHECKSUM__ placeholder." }
+            $script = $script.Replace('__VERSION__', $env:VERSION).Replace('__CHECKSUM__', $env:CHECKSUM)
+            [IO.File]::WriteAllText($env:INSTALL, $script, $utf8)
+          }
+          Write-Host "Filled: version $env:VERSION (package $env:PACKAGE_VERSION), checksum $env:CHECKSUM"
 
       - name: Pack
-        run: choco pack "choco/${{ inputs.package_id }}.nuspec" --output-directory "$env:RUNNER_TEMP\choco-out"
-        shell: pwsh
-
-      - name: Push to chocolatey.org
+        id: pack
+        env:
+          NUSPEC: ${{ steps.meta.outputs.nuspec }}
         run: |
-          $nupkg = Get-ChildItem "$env:RUNNER_TEMP\choco-out\*.nupkg" | Select-Object -First 1
-          choco push $nupkg.FullName --source https://push.chocolatey.org --api-key "${{ secrets.CHOCOLATEY_API_KEY }}"
-        shell: pwsh
+          $out = Join-Path $env:RUNNER_TEMP 'choco-out'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          choco pack $env:NUSPEC --output-directory $out --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "choco pack failed ($LASTEXITCODE)" }
+          $nupkgs = @(Get-ChildItem -LiteralPath $out -Filter *.nupkg -File)
+          if ($nupkgs.Count -ne 1) { throw "Expected exactly one .nupkg, found $($nupkgs.Count)" }
+          Write-Host "Packed $($nupkgs[0].Name)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value @(
+            "nupkg=$($nupkgs[0].FullName)",
+            "nupkg_name=$($nupkgs[0].Name)")
+
+      - name: Upload .nupkg as run artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.meta.outputs.package_id }}-${{ steps.meta.outputs.package_version }}-nupkg
+          path: ${{ steps.pack.outputs.nupkg }}
+          if-no-files-found: error
+          retention-days: ${{ inputs.artifact_retention_days }}
+
+      - name: Push to chocolatey.org (gated)
+        id: push
+        env:
+          CHOCO_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+          CANONICAL_REPO: ${{ inputs.canonical_repo }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+          PACKAGE_ID: ${{ steps.meta.outputs.package_id }}
+          PACKAGE_VERSION: ${{ steps.meta.outputs.package_version }}
+          NUPKG: ${{ steps.pack.outputs.nupkg }}
+          NUPKG_NAME: ${{ steps.pack.outputs.nupkg_name }}
+        run: |
+          $reasons = @()
+          if ($env:PRERELEASE -ne 'false') { $reasons += "tag '$env:TAG' contains '-' (prerelease/test tag)" }
+          if ($env:REPO_PRIVATE -ne 'false') { $reasons += "repository $env:GITHUB_REPOSITORY is private (or its visibility is unknown)" }
+          if ($env:CANONICAL_REPO -and $env:GITHUB_REPOSITORY -ne $env:CANONICAL_REPO) { $reasons += "repository $env:GITHUB_REPOSITORY is not $env:CANONICAL_REPO" }
+          if ([string]::IsNullOrEmpty($env:CHOCO_KEY)) { $reasons += 'secret CHOCOLATEY_API_KEY is not set' }
+
+          $summary = @("### Chocolatey: $env:PACKAGE_ID $env:PACKAGE_VERSION", '', "Run artifact: ``$env:PACKAGE_ID-$env:PACKAGE_VERSION-nupkg`` ($env:NUPKG_NAME)")
+          if ($reasons) {
+            $msg = "Chocolatey push SKIPPED: $($reasons -join '; ')"
+            Write-Host $msg
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($summary + @('', $msg))
+            Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'pushed=false'
+            exit 0
+          }
+
+          Write-Host "Pushing $env:NUPKG_NAME (id $env:PACKAGE_ID) to https://push.chocolatey.org/"
+          # Keep going on stderr output so the exit code and message can be checked below
+          $ErrorActionPreference = 'Continue'
+          $log = choco push $env:NUPKG --source https://push.chocolatey.org/ --api-key $env:CHOCO_KEY --no-progress 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $log
+          if ($code -ne 0) {
+            if ($log -match '403') {
+              Write-Host "::error::choco push got 403 Forbidden for package id '$env:PACKAGE_ID'. The id is most likely owned by another maintainer on community.chocolatey.org (check https://community.chocolatey.org/packages/$env:PACKAGE_ID), or the API key does not belong to an owner of this id. Change <id> in the nuspec or fix the CHOCOLATEY_API_KEY secret."
+            } elseif ($log -match '409') {
+              Write-Host "::error::choco push got 409 Conflict: version $env:PACKAGE_VERSION of '$env:PACKAGE_ID' already exists on community.chocolatey.org. Bump the version; a published version cannot be replaced."
+            } else {
+              Write-Host "::error::choco push failed with exit code $code."
+            }
+            Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'pushed=false'
+            exit $code
+          }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($summary + @('', 'Pushed to https://push.chocolatey.org/ (now awaiting moderation).'))
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'pushed=true'
