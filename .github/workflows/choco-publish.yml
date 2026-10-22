@@ -1,0 +1,88 @@
+name: Publish to Chocolatey
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Git tag of the release (e.g. v1.4.2)"
+        required: true
+        type: string
+      package_id:
+        description: "Chocolatey package id (lowercase, e.g. netpulse)"
+        required: true
+        type: string
+      zip_pattern:
+        description: "Glob to find the release asset zip (e.g. NetPulse-*-win64.zip)"
+        required: true
+        type: string
+      nuspec_path:
+        description: "Repo-relative path to the .nuspec template"
+        required: false
+        type: string
+        default: ""    # defaults to choco/<package_id>.nuspec
+      install_script_path:
+        description: "Repo-relative path to chocolateyinstall.ps1 template"
+        required: false
+        type: string
+        default: "choco/tools/chocolateyinstall.ps1"
+    secrets:
+      CHOCOLATEY_API_KEY:
+        required: true
+
+jobs:
+  publish:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - name: Download release zip and compute SHA256
+        id: asset
+        run: |
+          $tag     = "${{ inputs.release_tag }}"
+          $pattern = "${{ inputs.zip_pattern }}"
+          $version = $tag.TrimStart('v')
+
+          # Resolve the asset download URL via gh CLI
+          $url = gh release view $tag --json assets --jq ".assets[] | select(.name | test(\"$pattern\")) | .url" 2>&1
+          if (-not $url) { throw "No asset matching '$pattern' found in release $tag" }
+          Write-Host "Downloading: $url"
+
+          $zipPath = "$env:RUNNER_TEMP\release.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zipPath -Headers @{ Authorization = "Bearer $env:GH_TOKEN" }
+
+          $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash
+          Write-Host "SHA256: $hash"
+
+          echo "VERSION=$version"   >> $env:GITHUB_ENV
+          echo "CHECKSUM=$hash"     >> $env:GITHUB_ENV
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+
+      - name: Fill templates (version + checksum)
+        run: |
+          $id      = "${{ inputs.package_id }}"
+          $nuspec  = "${{ inputs.nuspec_path }}"
+          if (-not $nuspec) { $nuspec = "choco/$id.nuspec" }
+          $install = "${{ inputs.install_script_path }}"
+
+          foreach ($f in @($nuspec, $install)) {
+            (Get-Content $f) `
+              -replace '__VERSION__',  $env:VERSION `
+              -replace '__CHECKSUM__', $env:CHECKSUM |
+            Set-Content $f
+          }
+        shell: pwsh
+
+      - name: Pack
+        run: choco pack "choco/${{ inputs.package_id }}.nuspec" --output-directory "$env:RUNNER_TEMP\choco-out"
+        shell: pwsh
+
+      - name: Push to chocolatey.org
+        run: |
+          $nupkg = Get-ChildItem "$env:RUNNER_TEMP\choco-out\*.nupkg" | Select-Object -First 1
+          choco push $nupkg.FullName --source https://push.chocolatey.org --api-key "${{ secrets.CHOCOLATEY_API_KEY }}"
+        shell: pwsh
